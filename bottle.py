@@ -68,7 +68,7 @@ if __name__ == '__main__':
 
 
 import base64, cgi, email.utils, functools, hmac, imp, itertools, mimetypes,\
-        os, re, tempfile, threading, time, warnings
+        os, re, tempfile, threading, time, warnings, hashlib
 
 from types import FunctionType
 from datetime import date as datedate, datetime, timedelta
@@ -1012,9 +1012,12 @@ class Bottle(object):
             environ['bottle.app'] = self
             request.bind(environ)
             response.bind()
-            self.trigger_hook('before_request')
+            try:
+                self.trigger_hook('before_request')
+            except HTTPResponse:
+                return  _e()
             out = _inner_handle()
-            return out;
+            return out
         finally:
             if isinstance(out, HTTPResponse):
                 out.apply(response)
@@ -1266,12 +1269,14 @@ class BaseRequest(object):
 
     @DictProperty('environ', 'bottle.request.json', read_only=True)
     def json(self):
-        """ If the ``Content-Type`` header is ``application/json``, this
-            property holds the parsed content of the request body. Only requests
-            smaller than :attr:`MEMFILE_MAX` are processed to avoid memory
-            exhaustion. Invalid JSON raises a 400 error response. """
+        """ If the ``Content-Type`` header is ``application/json`` or
+            ``application/json-rpc``, this property holds the parsed content 
+            of the request body. Only requests smaller than :attr:`MEMFILE_MAX`
+            are processed to avoid memory exhaustion.
+            Invalid JSON raises a 400 error response.
+        """
         ctype = self.environ.get('CONTENT_TYPE', '').lower().split(';')[0]
-        if ctype == 'application/json':
+        if ctype in ('application/json', 'application/json-rpc'):
             b = self._get_body_string()
             if not b:
                 return None
@@ -1629,7 +1634,7 @@ class BaseResponse(object):
     # Header blacklist for specific response codes
     # (rfc2616 section 10.2.3 and 10.3.5)
     bad_headers = {
-        204: set(('Content-Type', )),
+        204: set(('Content-Type', 'Content-Length')),
         304: set(('Allow', 'Content-Encoding', 'Content-Language',
                   'Content-Length', 'Content-Range', 'Content-Type',
                   'Content-Md5', 'Last-Modified'))
@@ -2416,7 +2421,7 @@ class AppStack(list):
 
     def __call__(self):
         """ Return the current default application. """
-        return self[-1]
+        return self.default
 
     def push(self, value=None):
         """ Add a new :class:`Bottle` instance to the stack """
@@ -2424,6 +2429,13 @@ class AppStack(list):
             value = Bottle()
         self.append(value)
         return value
+    new_app = push
+    @property
+    def default(self):
+        try:
+            return self[-1]
+        except IndexError:
+            return self.push()
 
 
 class WSGIFileWrapper(object):
@@ -2637,29 +2649,42 @@ def _file_iter_range(fp, offset, bytes, maxread=1024 * 1024):
 
 
 def static_file(filename, root,
-                mimetype='auto',
+                mimetype=True,
                 download=False,
-                charset='UTF-8'):
-    """ Open a file in a safe way and return :exc:`HTTPResponse` with status
-        code 200, 305, 403 or 404. The ``Content-Type``, ``Content-Encoding``,
-        ``Content-Length`` and ``Last-Modified`` headers are set if possible.
-        Special support for ``If-Modified-Since``, ``Range`` and ``HEAD``
-        requests.
+                charset='UTF-8',
+                etag=None):
+    """ Open a file in a safe way and return an instance of :exc:`HTTPResponse`
+        that can be sent back to the client. 
 
-        :param filename: Name or path of the file to send.
+        :param filename: Name or path of the file to send, relative to ``root``.
         :param root: Root path for file lookups. Should be an absolute directory
             path.
-        :param mimetype: Defines the content-type header (default: guess from
+        :param mimetype: Provide the content-type header (default: guess from
             file extension)
         :param download: If True, ask the browser to open a `Save as...` dialog
             instead of opening the file with the associated program. You can
             specify a custom filename as a string. If not specified, the
             original filename is used (default: False).
-        :param charset: The charset to use for files with a ``text/*``
-            mime-type. (default: UTF-8)
+        :param charset: The charset for files with a ``text/*`` mime-type.
+            (default: UTF-8)
+        :param etag: Provide a pre-computed ETag header. If set to ``False``,
+            ETag handling is disabled. (default: auto-generate ETag header)
+
+        While checking user input is always a good idea, this function provides
+        additional protection against malicious ``filename`` parameters from
+        breaking out of the ``root`` directory and leaking sensitive information
+        to an attacker.
+
+        Read-protected files or files outside of the ``root`` directory are
+        answered with ``403 Access Denied``. Missing files result in a
+        ``404 Not Found`` response. Conditional requests (``If-Modified-Since``,
+        ``If-None-Match``) are answered with ``304 Not Modified`` whenever
+        possible. ``HEAD`` and ``Range`` requests (used by download managers to
+        check or continue partial downloads) are also handled automatically.
+
     """
 
-    root = os.path.abspath(root) + os.sep
+    root = os.path.join(os.path.abspath(root), '')
     filename = os.path.abspath(os.path.join(root, filename.strip('/\\')))
     headers = dict()
 
@@ -2670,7 +2695,7 @@ def static_file(filename, root,
     if not os.access(filename, os.R_OK):
         return HTTPError(403, "You do not have permission to access this file.")
 
-    if mimetype == 'auto':
+    if mimetype is True:
         if download and download != True:
             mimetype, encoding = mimetypes.guess_type(download)
         else:
@@ -2678,7 +2703,8 @@ def static_file(filename, root,
         if encoding: headers['Content-Encoding'] = encoding
 
     if mimetype:
-        if mimetype[:5] == 'text/' and charset and 'charset' not in mimetype:
+        if (mimetype[:5] == 'text/' or mimetype == 'application/javascript')\
+        and charset and 'charset' not in mimetype:
             mimetype += '; charset=%s' % charset
         headers['Content-Type'] = mimetype
 
@@ -2690,21 +2716,33 @@ def static_file(filename, root,
     headers['Content-Length'] = clen = stats.st_size
     lm = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(stats.st_mtime))
     headers['Last-Modified'] = lm
+    headers['Date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
 
-    ims = request.environ.get('HTTP_IF_MODIFIED_SINCE')
+    getenv = request.environ.get
+
+    if etag is None:
+        etag = '%d:%d:%d:%d:%s' % (stats.st_dev, stats.st_ino, stats.st_mtime,
+                                   clen, filename)
+        etag = hashlib.sha1(tob(etag)).hexdigest()
+
+    if etag:
+        headers['ETag'] = etag
+        check = getenv('HTTP_IF_NONE_MATCH')
+        if check and check == etag:
+            return HTTPResponse(status=304, **headers)
+
+    ims = getenv('HTTP_IF_MODIFIED_SINCE')
     if ims:
         ims = parse_date(ims.split(";")[0].strip())
     if ims is not None and ims >= int(stats.st_mtime):
-        headers['Date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
-                                        time.gmtime())
         return HTTPResponse(status=304, **headers)
 
     body = '' if request.method == 'HEAD' else open(filename, 'rb')
 
     headers["Accept-Ranges"] = "bytes"
-    ranges = request.environ.get('HTTP_RANGE')
-    if 'HTTP_RANGE' in request.environ:
-        ranges = list(parse_range_header(request.environ['HTTP_RANGE'], clen))
+    range_header = getenv('HTTP_RANGE')
+    if range_header:
+        ranges = list(parse_range_header(range_header, clen))
         if not ranges:
             return HTTPError(416, "Requested Range Not Satisfiable")
         offset, end = ranges[0]
@@ -2776,6 +2814,42 @@ def parse_range_header(header, maxlen=0):
             pass
 
 
+#: Header tokenizer used by _parse_http_header()
+_hsplit = re.compile('(?:(?:"((?:[^"\\\\]+|\\\\.)*)")|([^;,=]+))([;,=]?)').findall
+
+def _parse_http_header(h):
+    """ Parses a typical multi-valued and parametrised HTTP header (e.g. Accept headers) and returns a list of values
+        and parameters. For non-standard or broken input, this implementation may return partial results.
+    :param h: A header string (e.g. ``text/html,text/plain;q=0.9,*/*;q=0.8``)
+    :return: List of (value, params) tuples. The second element is a (possibly empty) dict.
+    """
+    values = []
+    if '"' not in h:  # INFO: Fast path without regexp (~2x faster)
+        for value in h.split(','):
+            parts = value.split(';')
+            values.append((parts[0].strip(), {}))
+            for attr in parts[1:]:
+                name, value = attr.split('=', 1)
+                values[-1][1][name.strip()] = value.strip()
+    else:
+        lop, key, attrs = ',', None, {}
+        for quoted, plain, tok in _hsplit(h):
+            value = plain.strip() if plain else quoted.replace('\\"', '"')
+            if lop == ',':
+                attrs = {}
+                values.append((value, attrs))
+            elif lop == ';':
+                if tok == '=':
+                    key = value
+                else:
+                    attrs[value] = ''
+            elif lop == '=' and key:
+                attrs[key] = value
+                key = None
+            lop = tok
+    return values
+
+
 def _parse_qsl(qs):
     r = []
     for pair in qs.replace(';', '&').split('&'):
@@ -2795,19 +2869,22 @@ def _lscmp(a, b):
                    for x, y in zip(a, b)) and len(a) == len(b)
 
 
-def cookie_encode(data, key):
+def cookie_encode(data, key, digestmod=None):
     """ Encode and sign a pickle-able object. Return a (byte) string """
+    digestmod = digestmod or hashlib.sha256
     msg = base64.b64encode(pickle.dumps(data, -1))
-    sig = base64.b64encode(hmac.new(tob(key), msg).digest())
+    sig = base64.b64encode(hmac.new(tob(key), msg, digestmod=digestmod).digest())
     return tob('!') + sig + tob('?') + msg
 
 
-def cookie_decode(data, key):
+def cookie_decode(data, key, digestmod=None):
     """ Verify and decode an encoded string. Return an object or None."""
     data = tob(data)
     if cookie_is_encoded(data):
         sig, msg = data.split(tob('?'), 1)
-        if _lscmp(sig[1:], base64.b64encode(hmac.new(tob(key), msg).digest())):
+        digestmod = digestmod or hashlib.sha256
+        hashed = hmac.new(tob(key), msg, digestmod=digestmod).digest()
+        if _lscmp(sig[1:], base64.b64encode(hashed)):
             return pickle.loads(base64.b64decode(msg))
     return None
 
@@ -3029,7 +3106,7 @@ class CherryPyServer(ServerAdapter):
 class WaitressServer(ServerAdapter):
     def run(self, handler):
         from waitress import serve
-        serve(handler, host=self.host, port=self.port, _quiet=self.quiet)
+        serve(handler, host=self.host, port=self.port, _quiet=self.quiet, **self.options)
 
 
 class PasteServer(ServerAdapter):
@@ -3127,20 +3204,18 @@ class DieselServer(ServerAdapter):
 class GeventServer(ServerAdapter):
     """ Untested. Options:
 
-        * `fast` (default: False) uses libevent's http server, but has some
-          issues: No streaming, no pipelining, no SSL.
         * See gevent.wsgi.WSGIServer() documentation for more options.
     """
 
     def run(self, handler):
-        from gevent import wsgi, pywsgi, local
+        from gevent import pywsgi, local
         if not isinstance(threading.local(), local.local):
             msg = "Bottle requires gevent.monkey.patch_all() (before import)"
             raise RuntimeError(msg)
-        if not self.options.pop('fast', None): wsgi = pywsgi
-        self.options['log'] = None if self.quiet else 'default'
+        if self.quiet:
+            self.options['log'] = None
         address = (self.host, self.port)
-        server = wsgi.WSGIServer(address, handler, **self.options)
+        server = pywsgi.WSGIServer(address, handler, **self.options)
         if 'BOTTLE_CHILD' in os.environ:
             import signal
             signal.signal(signal.SIGINT, lambda s, f: server.stop())
@@ -3437,7 +3512,7 @@ def run(app=None,
 
 class FileCheckerThread(threading.Thread):
     """ Interrupt main-thread as soon as a changed module file is detected,
-        the lockfile gets deleted or gets to old. """
+        the lockfile gets deleted or gets too old. """
 
     def __init__(self, lockfile, interval):
         threading.Thread.__init__(self)
@@ -3631,7 +3706,10 @@ class Jinja2Template(BaseTemplate):
         return self.tpl.render(**_defaults)
 
     def loader(self, name):
-        fname = self.search(name, self.lookup)
+        if name == self.filename:
+            fname = name
+        else:
+            fname = self.search(name, self.lookup)
         if not fname: return
         with open(fname, "rb") as f:
             return f.read().decode(self.encoding)
@@ -3676,7 +3754,7 @@ class SimpleTemplate(BaseTemplate):
         env = _env.copy()
         env.update(kwargs)
         if _name not in self.cache:
-            self.cache[_name] = self.__class__(name=_name, lookup=self.lookup)
+            self.cache[_name] = self.__class__(name=_name, lookup=self.lookup, syntax=self.syntax)
         return self.cache[_name].execute(env['_stdout'], env)
 
     def execute(self, _stdout, kwargs):
@@ -3908,6 +3986,8 @@ def template(*args, **kwargs):
     or directly (as keyword arguments).
     """
     tpl = args[0] if args else None
+    for dictarg in args[1:]:
+        kwargs.update(dictarg)
     adapter = kwargs.pop('template_adapter', SimpleTemplate)
     lookup = kwargs.pop('template_lookup', TEMPLATE_PATH)
     tplid = (id(lookup), tpl)
@@ -3922,8 +4002,6 @@ def template(*args, **kwargs):
             TEMPLATES[tplid] = adapter(name=tpl, lookup=lookup, **settings)
     if not TEMPLATES[tplid]:
         abort(500, 'Template (%s) not found' % tpl)
-    for dictarg in args[1:]:
-        kwargs.update(dictarg)
     return TEMPLATES[tplid].render(kwargs)
 
 
@@ -4033,10 +4111,10 @@ response = LocalResponse()
 #: A thread-safe namespace. Not used by Bottle.
 local = threading.local()
 
-# Initialize app stack (create first empty Bottle app)
+# Initialize app stack (create first empty Bottle app now deferred until needed)
 # BC: 0.6.4 and needed for run()
-app = default_app = AppStack()
-app.push()
+apps = app = default_app = AppStack()
+
 
 #: A virtual package that redirects import statements.
 #: Example: ``import bottle.ext.sqlite`` actually imports `bottle_sqlite`.
